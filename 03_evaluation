@@ -1,0 +1,88 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.meteor_score import meteor_score
+from rouge import Rouge
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Function to evaluate BLEU score
+def evaluate_bleu(reference, candidate):
+    return sentence_bleu([reference.split()], candidate.split())
+
+# Function to evaluate ROUGE score
+def evaluate_rouge(reference, candidate):
+    rouge = Rouge()
+    scores = rouge.get_scores(candidate, reference)
+    return scores[0]
+
+# Function to evaluate METEOR score
+def evaluate_meteor(reference, candidate):
+    return meteor_score([reference], candidate)
+
+# Function to evaluate translation metrics
+def evaluate_translation_metrics(reference, candidate):
+    bleu_score = evaluate_bleu(reference, candidate)
+    rouge_score = evaluate_rouge(reference, candidate)
+    meteor = evaluate_meteor(reference, candidate)
+    return bleu_score, rouge_score, meteor
+
+# Read the dataset with translations
+translated_df = pd.read_csv("translated_text.csv")  # Adjust the file name as needed
+
+# Perform stratified sampling based on language
+strata = translated_df['language']
+sample_size = int(0.10 * len(translated_df))  # Adjust sample size as needed
+sample_df, _ = train_test_split(translated_df, stratify=strata, test_size=(1 - sample_size / len(translated_df)))
+
+# Columns containing the reference and candidate translations
+reference_columns = ["observation", "problem_cause", "problem_code", "solution"]
+candidate_columns = [f"{col}_translated" for col in reference_columns]
+
+# Initialize lists to store evaluation results
+bleu_scores = []
+rouge_scores = []
+meteor_scores = []
+
+# Evaluate each translation in the sample
+for index, row in sample_df.iterrows():
+    for ref_col, cand_col in zip(reference_columns, candidate_columns):
+        reference_text = row[ref_col]
+        candidate_text = row[cand_col]
+        
+        if pd.isna(reference_text) or pd.isna(candidate_text):
+            continue  # Skip evaluation for empty texts
+        
+        bleu, rouge, meteor = evaluate_translation_metrics(reference_text, candidate_text)
+        bleu_scores.append(bleu)
+        rouge_scores.append(rouge)
+        meteor_scores.append(meteor)
+
+# Calculate average scores
+avg_bleu = sum(bleu_scores) / len(bleu_scores) if bleu_scores else 0
+avg_rouge = {
+    "rouge-1": sum([score["rouge-1"]["f"] for score in rouge_scores]) / len(rouge_scores) if rouge_scores else 0,
+    "rouge-2": sum([score["rouge-2"]["f"] for score in rouge_scores]) / len(rouge_scores) if rouge_scores else 0,
+    "rouge-l": sum([score["rouge-l"]["f"] for score in rouge_scores]) / len(rouge_scores) if rouge_scores else 0,
+}
+avg_meteor = sum(meteor_scores) / len(meteor_scores) if meteor_scores else 0
+
+# Log the results
+logging.info(f"Average BLEU Score: {avg_bleu}")
+logging.info(f"Average ROUGE-1 F1 Score: {avg_rouge['rouge-1']}")
+logging.info(f"Average ROUGE-2 F1 Score: {avg_rouge['rouge-2']}")
+logging.info(f"Average ROUGE-L F1 Score: {avg_rouge['rouge-l']}")
+logging.info(f"Average METEOR Score: {avg_meteor}")
+
+# Save results to a CSV file
+results_df = pd.DataFrame({
+    "BLEU": bleu_scores,
+    "ROUGE-1": [score["rouge-1"]["f"] for score in rouge_scores],
+    "ROUGE-2": [score["rouge-2"]["f"] for score in rouge_scores],
+    "ROUGE-L": [score["rouge-l"]["f"] for score in rouge_scores],
+    "METEOR": meteor_scores
+})
+results_df.to_csv("translation_evaluation_results_sample.csv", index=False)
