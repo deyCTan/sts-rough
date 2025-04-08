@@ -10,14 +10,9 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Read recipe inputs
-sts_cmb = dataiku.Dataset("sts_cmb")
+sts_cmb = dataiku.Dataset("sts_combined")
 sts_cmb_df = sts_cmb.get_dataframe(infer_with_pandas=False)
 sts_cmb_df['status'] = "New"
-
-# Sample function - comment out for full processing
-# def sample_projects(df, project_column='project', n_samples=10):
-#     return df.groupby(project_column).apply(lambda x: x.sample(n=n_samples)).reset_index(drop=True)
-# sts_cmb_df = sample_projects(sts_cmb_df, project_column='project', n_samples=20)
 
 # Define the LLM ID
 LLM_ID = "openai:Lite_llm_STS_Dev_GPT_4O:gpt-35-turbo-16k"
@@ -41,50 +36,148 @@ language_map = {
 # Constants for chunking and processing
 BATCH_SIZE = 100  # Process records in batches of 100
 MAX_WORKERS = 4   # Number of parallel workers
+MAX_RETRIES = 2   # Maximum number of retries for failed translations
 
-# Function to translate a single record
-def translate_record(record_data):
-    index, row, language = record_data
-    translations = {}
+# Language-specific prompts tailored for technical text
+def get_translation_prompt(language, observation, solution):
     lang_name = language_map.get(language, "Unknown")
-
-    for column in ["observation", "problem_cause", "problem_code", "solution"]:
-        # Skip empty fields for problem code and cause
-        if column in ["problem_code", "problem_cause"] and pd.isna(row[column]):
-            translations[f"{column}_translated"] = ''
-            continue
-
-        # Skip translation for English
-        if language == 'en':
-            translations[f"{column}_translated"] = row[column]
-            continue
-
-        message_text = f"""
-        You are an expert language translator. Your task is to precisely translate the given text from {lang_name} to English. Please adhere to the following guidelines:
-        1. Deliver only the translation without any additional commentary or explanations. Do not preamble.
-        2. Ensure the translation is accurate and avoid generating any false or fabricated information. Clean the data by removing any Unicode and special characters.
-        3. If the input text is empty, respond with an empty string.
-        4. Do not add any punctuation.
-        5. Ensure that the translated text maintains the meaning and context of the original text.
-
-        Translate the following text: '{row[column]}'
+    if language == 'en':
+        # Rephrase or clean English text
+        return f"""
+        You are an expert editor for technical troubleshooting documentation. Your task is to enhance the readability of the following English text without changing the meaning or modifying any technical terms.
+        Observation: {observation}
+        Solution: {solution}
+        Provide the improved texts as follows:
+        Observation: <improved_observation>
+        Solution: <improved_solution>
+        """
+    elif language == 'fr':
+        return f"""
+        You are an expert translator for French technical troubleshooting text. Translate the following text into precise English while preserving technical terms and context:
+        Observation: {observation}
+        Solution: {solution}
+        Do not simplify or modify technical terms.
+        Provide the translations as follows:
+        Observation: <translated_observation>
+        Solution: <translated_solution>
+        """
+    elif language == 'it':
+        return f"""
+        You are an expert translator for Italian technical troubleshooting text. Translate the following text into precise English while preserving technical terms and context:
+        Observation: {observation}
+        Solution: {solution}
+        Do not simplify or modify technical terms.
+        Provide the translations as follows:
+        Observation: <translated_observation>
+        Solution: <translated_solution>
+        """
+    elif language == 'kk':
+        return f"""
+        You are an expert translator for Kazakh technical troubleshooting text. Translate the following text into precise English while preserving technical terms and context:
+        Observation: {observation}
+        Solution: {solution}
+        Do not simplify or modify technical terms.
+        Provide the translations as follows:
+        Observation: <translated_observation>
+        Solution: <translated_solution>
+        """
+    elif language == 'ru':
+        return f"""
+        You are an expert translator for Russian technical troubleshooting text. Translate the following text into precise English while preserving technical terms and context:
+        Observation: {observation}
+        Solution: {solution}
+        Do not simplify or modify technical terms.
+        Provide the translations as follows:
+        Observation: <translated_observation>
+        Solution: <translated_solution>
+        """
+    elif language == 'es':
+        return f"""
+        You are an expert translator for Spanish technical troubleshooting text. Translate the following text into precise English while preserving technical terms and context:
+        Observation: {observation}
+        Solution: {solution}
+        Do not simplify or modify technical terms.
+        Provide the translations as follows:
+        Observation: <translated_observation>
+        Solution: <translated_solution>
+        """
+    elif language == 'sv':
+        return f"""
+        You are an expert translator for Swedish technical troubleshooting text. Translate the following text into precise English while preserving technical terms and context:
+        Observation: {observation}
+        Solution: {solution}
+        Do not simplify or modify technical terms.
+        Provide the translations as follows:
+        Observation: <translated_observation>
+        Solution: <translated_solution>
+        """
+    else:
+        # Generic fallback prompt
+        return f"""
+        Translate the following technical troubleshooting text into precise English:
+        Observation: {observation}
+        Solution: {solution}
+        Preserve technical terms and context without simplification.
+        Provide the translations as follows:
+        Observation: <translated_observation>
+        Solution: <translated_solution>
         """
 
+# Function to process a single record
+def translate_record(record_data):
+    index, row, language = record_data
+    lang_name = language_map.get(language, "Unknown")
+    observation = row["observation"] if not pd.isna(row["observation"]) else ""
+    solution = row["solution"] if not pd.isna(row["solution"]) else ""
+
+    # Skip translation for English
+    if language == 'en':
+        return index, {
+            "observation_translated": observation,
+            "solution_translated": solution
+        }
+
+    # Prepare prompt
+    message_text = get_translation_prompt(language, observation, solution)
+
+    # Retry mechanism
+    for attempt in range(MAX_RETRIES + 1):
         try:
             completion = llm.new_completion()
             completion.with_message(message_text)
             resp = completion.execute()
 
             if resp.success:
-                translations[f"{column}_translated"] = resp.text
+                # Extract translations from response
+                translated_text = resp.text
+                obs_translated, sol_translated = parse_translated_text(translated_text)
+                return index, {
+                    "observation_translated": obs_translated,
+                    "solution_translated": sol_translated
+                }
             else:
-                logging.error(f"Translation failed for index {index}, column {column}, language {lang_name}. Response: {resp.text}")
-                translations[f"{column}_translated"] = row[column]  # Keep original on failure
-        except Exception as e:
-            logging.error(f"Error during translation for index {index}, column {column}: {e}")
-            translations[f"{column}_translated"] = row[column]  # Keep original on failure
+                logging.error(f"Translation failed for index {index}, language {lang_name}. Attempt {attempt+1}/{MAX_RETRIES}. Response: {resp.text}")
 
-    return index, translations
+        except Exception as e:
+            logging.error(f"Error during translation for index {index}, language {lang_name}, attempt {attempt+1}/{MAX_RETRIES}: {e}")
+
+    # If all retries fail, keep the original values
+    return index, {
+        "observation_translated": observation,
+        "solution_translated": solution
+    }
+
+# Function to parse translation response (assumes specific formatting)
+def parse_translated_text(translated_text):
+    try:
+        obs_start = translated_text.find("Observation: ") + len("Observation: ")
+        sol_start = translated_text.find("Solution: ")
+        obs_translated = translated_text[obs_start:sol_start].strip()
+        sol_translated = translated_text[sol_start + len("Solution: "):].strip()
+        return obs_translated, sol_translated
+    except Exception as e:
+        logging.error(f"Error parsing translated text: {e}")
+        return "", ""
 
 # Function to process records in batches with parallelization
 def process_in_batches(df, batch_size=BATCH_SIZE):
@@ -136,72 +229,5 @@ for column in sts_cmb_trns_df.columns:
         sts_cmb_trns_df[column] = sts_cmb_trns_df[column].fillna(0)
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-# Define the columns to check for translation failures
-columns_to_check = ["observation", "solution"]
-
-def identify_failed_rows(df):
-    # Filter for non-English rows
-    non_english_rows = df[df['language'] != 'en']
-
-    # Initialize a list to store indices of failed rows
-    failed_indices = []
-
-    # Check for matching original and translated values
-    for idx, row in non_english_rows.iterrows():
-        failed = False
-        for col in columns_to_check:
-            original_value = row[col]
-            translated_value = row[f"{col}_translated"]
-
-            # Skip checks if the original value is NaN
-            if pd.isna(original_value):
-                continue
-
-            # Check if the translated value matches the original value
-            if str(original_value).strip() == str(translated_value).strip():
-                failed = True
-                break  # No need to check further columns for this row
-
-        if failed:
-            failed_indices.append(idx)
-
-    return failed_indices
-
-# Identify failed rows
-failed_indices = identify_failed_rows(sts_cmb_trns_df)
-
-# Separate failed rows from the main dataset
-failed_rows_df = sts_cmb_trns_df.loc[failed_indices].copy()
-successful_rows_df = sts_cmb_trns_df.loc[~sts_cmb_trns_df.index.isin(failed_indices)].copy()
-
-# Print summary
-print(f"Total failed rows identified: {len(failed_rows_df)}")
-print(f"Total successful rows: {len(successful_rows_df)}")
-
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-failed_rows_df['status'] = "New"
-
-retry_results = process_in_batches(failed_rows_df, batch_size=100)
-
-# Update the main DataFrame with retry results
-for idx, translations in retry_results.items():
-    for col, value in translations.items():
-        sts_cmb_trns_df.at[idx, col] = value
-
-# Mark retried rows as "Processed"
-sts_cmb_trns_df.loc[failed_rows_df.index, 'status'] = "Processed"
-
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-# Identify remaining failed rows after retry
-remaining_failed_indices = identify_failed_rows(sts_cmb_trns_df)
-
-# Separate remaining failed rows
-remaining_failed_rows_df = sts_cmb_trns_df.loc[remaining_failed_indices].copy()
-
-# Log summary
-print(f"Remaining failed rows after retry: {len(remaining_failed_rows_df)}")
-
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-sts_cmb_trns_out = dataiku.Dataset("sts_cmb_trns_final")
+sts_cmb_trns_out = dataiku.Dataset("sts_combined_translated")
 sts_cmb_trns_out.write_with_schema(sts_cmb_trns_df)
-
