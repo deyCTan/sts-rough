@@ -1,0 +1,136 @@
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# -*- coding: utf-8 -*-
+import dataiku
+import pandas as pd, numpy as np
+from dataiku import pandasutils as pdu
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.meteor_score import meteor_score
+from rouge import Rouge
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Function to evaluate BLEU score with smoothing
+def evaluate_bleu(reference, candidate):
+    smoothing_function = SmoothingFunction().method4
+    return sentence_bleu([reference.split()], candidate.split(), smoothing_function=smoothing_function)
+
+# Function to evaluate ROUGE score
+def evaluate_rouge(reference, candidate):
+    rouge = Rouge()
+    scores = rouge.get_scores(candidate, reference)
+    return scores[0]
+
+# Function to evaluate METEOR score
+def evaluate_meteor(reference, candidate):
+    # Tokenize the reference and candidate texts
+    reference_tokens = reference.split()
+    candidate_tokens = candidate.split()
+    return meteor_score([reference_tokens], candidate_tokens)
+
+# Function to evaluate translation metrics
+def evaluate_translation_metrics(reference, candidate):
+    bleu_score = evaluate_bleu(reference, candidate)
+    rouge_score = evaluate_rouge(reference, candidate)
+    meteor = evaluate_meteor(reference, candidate)
+    return bleu_score, rouge_score, meteor
+
+# Read the dataset with translations
+sts_cmb_trns_final_filled = dataiku.Dataset("sts_cmb_trns_cln")
+translated_df = sts_cmb_trns_final_filled.get_dataframe(infer_with_pandas=False)
+
+# Log initial row count
+initial_row_count = len(translated_df)
+logging.info(f"Initial row count: {initial_row_count}")
+
+# Filter out rows where source and target languages are the same (e.g., "en-en")
+translated_df = translated_df[translated_df['language'] != "en"]
+
+# Log row count after filtering
+filtered_row_count = len(translated_df)
+logging.info(f"Row count after filtering out en-en translations: {filtered_row_count}")
+
+# # Perform stratified sampling based on language
+# strata = translated_df['language']
+# sample_size = int(0.10 * len(translated_df))
+# sample_df, _ = train_test_split(translated_df, stratify=strata, test_size=(1 - sample_size / len(translated_df)))
+
+# # Log sampled row count
+# sampled_row_count = len(sample_df)
+# logging.info(f"Sampled row count: {sampled_row_count}")
+
+translated_df.rename(
+    columns={
+        "obs_final_trns": "observation_final_translated"
+    },
+    inplace=True
+)
+
+# Columns containing the reference and candidate translations
+reference_columns = ["observation_final", "problem_cause_text", "solution_final"]
+candidate_columns = [f"{col}_translated" for col in reference_columns]
+
+# Initialize dictionaries to store evaluation results grouped by language
+evaluation_results = {}
+
+# Initialize counter for skipped rows
+skipped_rows = 0
+
+# Evaluate each translation in the dataset
+for index, row in translated_df.iterrows():
+    language = row['language']
+
+    if language not in evaluation_results:
+        evaluation_results[language] = {
+            "bleu_scores": [],
+            "rouge_scores": [],
+            "meteor_scores": []
+        }
+
+    for ref_col, cand_col in zip(reference_columns, candidate_columns):
+        reference_text = row[ref_col]
+        candidate_text = row[cand_col]
+
+        if pd.isna(reference_text) or pd.isna(candidate_text):
+            skipped_rows += 1
+            continue  # Skip evaluation for empty texts
+
+        bleu, rouge, meteor = evaluate_translation_metrics(reference_text, candidate_text)
+        evaluation_results[language]["bleu_scores"].append(bleu)
+        evaluation_results[language]["rouge_scores"].append(rouge)
+        evaluation_results[language]["meteor_scores"].append(meteor)
+
+# Log the number of skipped rows
+logging.info(f"Number of skipped rows due to empty texts: {skipped_rows}")
+
+# Calculate average scores grouped by language
+summary_results = []
+for language, scores in evaluation_results.items():
+    avg_bleu = sum(scores["bleu_scores"]) / len(scores["bleu_scores"]) if scores["bleu_scores"] else 0
+    avg_rouge = {
+        "rouge-1": sum([score["rouge-1"]["f"] for score in scores["rouge_scores"]]) / len(scores["rouge_scores"]) if scores["rouge_scores"] else 0,
+        "rouge-2": sum([score["rouge-2"]["f"] for score in scores["rouge_scores"]]) / len(scores["rouge_scores"]) if scores["rouge_scores"] else 0,
+        "rouge-l": sum([score["rouge-l"]["f"] for score in scores["rouge_scores"]]) / len(scores["rouge_scores"]) if scores["rouge_scores"] else 0,
+    }
+    avg_meteor = sum(scores["meteor_scores"]) / len(scores["meteor_scores"]) if scores["meteor_scores"] else 0
+
+    summary_results.append({
+        "language": language,
+        "avg_bleu": avg_bleu,
+        "avg_rouge-1": avg_rouge["rouge-1"],
+        "avg_rouge-2": avg_rouge["rouge-2"],
+        "avg_rouge-l": avg_rouge["rouge-l"],
+        "avg_meteor": avg_meteor
+    })
+
+# Convert summary results to a DataFrame
+summary_df = pd.DataFrame(summary_results)
+
+# Log the summary results
+logging.info("Summary of average scores by language:")
+logging.info(summary_df)
+
+# Write the summary results to a new Dataiku dataset
+evaluation_summary = dataiku.Dataset("trns_eval_result")
+evaluation_summary.write_with_schema(summary_df)
