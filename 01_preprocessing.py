@@ -1,12 +1,14 @@
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 import dataiku
-import pandas as pd
-import regex as re
-import unicodedata
 import logging
+import unicodedata
+import regex as re
+import numpy as np
+import pandas as pd
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # List of dataset names
 dataset_names = [
@@ -16,50 +18,73 @@ dataset_names = [
     "sts_xtrapolis_chile", "sts_vline_rrsmc", "sts_u400_Lyon", "sts_u400"
 ]
 
-# Load all datasets
-logging.info("Loading Datasets... ")
+# Load datasets into a dictionary of DataFrames
 dataframes = {name: dataiku.Dataset(name).get_dataframe() for name in dataset_names}
-logging.info("Datasets Loaded! ✅")
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-# Filter incomplete and invalid records
-logging.info("Filtering incomplete and invalid records...")
-invalid_patterns = [r"^$", r"^\s+$", r"####", r"#NAME?", r"-", r"^\d+$", r"^\s*$", r"^[!@#$%^&*(),.?\":{}|<>]+$", r"N/A - N/A"]
+# Define patterns to identify absurd or meaningless text
+INVALID_PATTERNS = [
+    r"^\s*$",              # Empty strings
+    r"^\d+$",              # Pure numbers
+    r"^[!@#$%^&*(),.?\":{}|<>]+$",  # Only special characters
+    r"^(.)\1{3,}$",        # Repeated characters (e.g., "aaaaaa")
+    r"^(nan|na)$",         # Literal "nan" or "na" (case insensitive)
+    r"^n/a\s*-\s*n/a$",    # Placeholder: N/A – N/A or n/a – n/a
+    r"^\.\s*-\s*\.$",      # Placeholder: . - .
+    r"####",               # Placeholder: ####
+    r"#NAME\?",            # Placeholder: #NAME?
+    r"^-+$"                # Placeholder: ---- or ---
+]
 
-def filter_invalid_records(df, invalid_patterns):
+# Replace invalid patterns with an empty string
+def clean_column(dataframe, column_name):
+    """
+    Cleans a specific column of a DataFrame by replacing invalid patterns with an empty string.
+    Ensures all values are strings before applying the regex cleaning.
+    """
+    if column_name in dataframe.columns:
+        dataframe[column_name] = dataframe[column_name].astype(str).str.strip()
+        for pattern in INVALID_PATTERNS:
+            dataframe[column_name] = dataframe[column_name].replace(to_replace=pattern, value="", regex=True)
+    return dataframe
 
-    combined_pattern = "|".join(invalid_patterns)
-
-    if "observation" in df.columns and "solution" in df.columns:
-        df = df[
-            ~df["observation"].astype(str).str.match(combined_pattern, na=False) &
-            ~df["solution"].astype(str).str.match(combined_pattern, na=False)
-        ]
-    df = df.dropna(subset=["observation", "solution"], how="any")
+# Apply cleaning to specified columns
+def clean_specified_columns(df, columns_to_clean):
+    for column in columns_to_clean:
+        df = clean_column(df, column)
     return df
 
-dataframes = {name: filter_invalid_records(df, invalid_patterns) for name, df in dataframes.items()}
-logging.info("Data cleaning complete! ✅")
+# Drop rows where 'observation' or 'solution' is empty
+def drop_empty_observation_or_solution(df):
+    if 'observation' in df.columns and 'solution' in df.columns:
+        df = df[(df['observation'].str.strip() != "") & (df['solution'].str.strip() != "")]
+    return df
+
+# Columns to clean
+columns_to_clean = ["observation", "solution", "observationcategory", "solutioncategory", "problemcause"]
+
+# Process all datasets
+for name, df in dataframes.items():
+    df = clean_specified_columns(df, columns_to_clean)
+    df = drop_empty_observation_or_solution(df)
+    dataframes[name] = df
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # Standardize metadata
-logging.info("Standardizing metadata...")
+logger.info("Standardizing metadata...")
 
 def standardize_metadata(df, name):
     mode_values = {}
     for col in ["project", "database", "language"]:
-        if col in df.columns and not df[col].dropna().empty:
-            mode_values[col] = df[col].value_counts().idxmax()
-        else:
-            mode_values[col] = name
+        mode_values[col] = df[col].value_counts().idxmax() if col in df.columns and not df[col].dropna().empty else name
         df[col] = df[col].fillna(mode_values[col]) if col in df.columns else mode_values[col]
     return df
 
 dataframes = {name: standardize_metadata(df, name) for name, df in dataframes.items()}
+logger.info("Metadata standardization complete! ✅")
 
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # Standardize inconsistent values
-logging.info("Standardizing inconsistent values...")
+logger.info("Standardizing inconsistent values...")
 
 def standardize_values(df, name):
     if name == "LMRC" and "language" in df.columns:
@@ -68,52 +93,24 @@ def standardize_values(df, name):
         df["project"] = "222 - EMR"
     if name == "sts_xtrapolis_chile" and "project" in df.columns:
         df["project"] = df["project"].replace({"MERVAL": "Merval", "merval": "Merval"})
-    if name == "sts_u400":
-        if "language" in df.columns:
-            df["language"] = df["language"].replace({"ENGLISH": "English", "SPANISH": "Spanish"})
+    if name == "sts_u400" and "language" in df.columns:
+        df["language"] = df["language"].replace({"ENGLISH": "English", "SPANISH": "Spanish"})
     if "database" in df.columns:
         df = df[df["database"] != "STS_U400_6.0"]
     return df
 
 dataframes = {name: standardize_values(df, name) for name, df in dataframes.items()}
-logging.info("Standardization complete! ✅")
+logger.info("Standardization of values complete! ✅")
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-def clean_text(text):
-    if pd.isna(text):
-        return ""
-
-    # Unicode normalization
-    text = unicodedata.normalize('NFKC', str(text)).strip()
-
-    # Fix spacing around punctuation (language-agnostic approach)
-    text = re.sub(r'(?<=\p{L})\.(?=\p{L})', '. ', text)
-    text = re.sub(r'(?<=\d)\s*\.\s*(?=\d)', '.', text)
-    text = re.sub(r'\s+', ' ', text)
-
-    # Keep all alphabetic characters from any language, plus common punctuation
-    text = re.sub(r'[^\p{L}\p{N}\s\p{P}\p{S}]', '', text)
-
-    return text.strip()
-
-logging.info("Applying preprocessing...")
-for name, df in dataframes.items():
-    logging.info(f"Preprocessing {name}...")
-    required_columns = ["observation", "problemcause", "solution", "problemcode"]
-
-    # Check if all required columns are present
-    if all(column in df.columns for column in required_columns):
-        df[required_columns] = df[required_columns].map(clean_text)
-
-# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-# Merge all dataframes into a single dataset
-logging.info("Merging all dataframes into a single dataset...")
+# Merge all dataframes
+logger.info("Merging all dataframes into a single dataset...")
 combined_df = pd.concat(dataframes.values(), ignore_index=True)
-logging.info(f"Merging complete! ✅ Final dataset has {combined_df.shape[0]} rows and {combined_df.shape[1]} columns.")
+logger.info(f"Merging complete! ✅ Final dataset has {combined_df.shape[0]} rows and {combined_df.shape[1]} columns.")
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # Standardize language values
-logging.info("Standardizing language values...")
+logger.info("Standardizing language values...")
 language_mapping = {
     "ENGLISH": "English",
     "RUS": "Russian",
@@ -138,25 +135,64 @@ def standardize_language(lang):
         return 'unknown'
     lang = str(lang).strip().lower()
     if lang not in valid_languages:
-        logging.warning(f"⚠️ Unknown language detected: {lang}")
+        logger.warning(f"⚠️ Unknown language detected: {lang}")
     return valid_languages.get(lang, 'unknown')
 
 if "language" in combined_df.columns:
     combined_df["language"] = combined_df["language"].apply(standardize_language)
 
-logging.info("\n🔍 Unique values in 'language' after standardization:")
-logging.info(combined_df["language"].unique())
-logging.info(f"Total unique values in 'language': {combined_df['language'].nunique()}")
+# Log unique values and their count after standardization
+unique_languages = combined_df["language"].unique()
+logger.info(f"🔍 Unique values in 'language' after standardization: {unique_languages}")
+logger.info(f"Total unique values in 'language': {len(unique_languages)}")
+
+# Language-specific cleaning rules
+LANGUAGE_CLEANERS = {
+    'fr': lambda text: re.sub(r'[’]', "'", text).replace('é', 'e').replace('è', 'e').replace('ê', 'e').replace('ë', 'e')
+                  .replace('à', 'a').replace('â', 'a').replace('ô', 'o'),
+    'es': lambda text: re.sub(r'[áéíóúñ]', lambda m: m.group(0).replace('á', 'a').replace('é', 'e')
+                                                    .replace('í', 'i').replace('ó', 'o').replace('ú', 'u')
+                                                    .replace('ñ', 'n'), text),
+    'ru': lambda text: re.sub(r'[^\p{Cyrillic}\p{Latin}\p{P}\p{N}\s@#$%&/\\=_\-+~°±№«»“”\'"…<>†™®©€₸₽]', '', text),
+    'kk': lambda text: re.sub(r'[^\p{Cyrillic}\p{Latin}\p{P}\p{N}\s@#$%&/\\=_\-+~°±№«»“”\'"…<>†™®©€₸₽]', '', text),
+    'it': lambda text: re.sub(r'[àèéìòù]', lambda m: m.group(0).replace('à', 'a').replace('è', 'e').replace('é', 'e')
+                                                    .replace('ì', 'i').replace('ò', 'o').replace('ù', 'u'), text),
+    'sv': lambda text: re.sub(r'[åäö]', lambda m: m.group(0).lower().replace('å', 'a').replace('ä', 'a')
+                                                               .replace('ö', 'o'), text),
+}
+
+# Main text cleaning function
+def clean_text(text, lang='generic'):
+    try:
+        if pd.isna(text): return ""
+        text = unicodedata.normalize('NFC', str(text)).strip()
+        if lang in LANGUAGE_CLEANERS: text = LANGUAGE_CLEANERS[lang](text)
+        text = re.sub(r'\s+', ' ', re.sub(r'[^\p{L}\p{N}\s\p{P}]', '', text).strip())
+        return text
+    except Exception as e:
+        logger.error(f"Error cleaning text for language '{lang}': {e}. Input text: {text}")
+        return text
+
+# Apply language-specific cleaning to relevant columns
+if "language" in combined_df.columns:
+    combined_df["language"] = combined_df["language"].fillna('unknown')
+    columns_to_clean = ["observationcategory", "observation", "problemcause", "solutioncategory", "solution"]
+
+    for column in columns_to_clean:
+        if column in combined_df.columns:
+            combined_df[column] = combined_df.apply(
+                lambda row: clean_text(row[column], row["language"]), axis=1
+            )
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # Standardize database values
-logging.info("Standardizing 'database' values...")
+logger.info("Standardizing 'database' values...")
 database_mapping = {"Rex": "REX"}
 if "database" in combined_df.columns:
     combined_df["database"] = combined_df["database"].replace(database_mapping)
 
 # Ensure metadata columns exist
-logging.info("Ensuring metadata columns exist...")
+logger.info("Ensuring metadata columns exist...")
 METADATA_COLUMNS = [
     'project', 'fleet', 'subsystem', 'database', 'observationcategory',
     'problemcode', 'problemcause', 'solutioncategory', 'language',
@@ -165,19 +201,9 @@ METADATA_COLUMNS = [
 
 for col in METADATA_COLUMNS:
     if col not in combined_df.columns:
-        combined_df[col] = 'Unknown'
-
-# Remove rows where 'observation' is an empty string
-combined_df = combined_df[combined_df['observation'] != '']
-
-# Remove rows where 'solution' is an empty string
-combined_df = combined_df[combined_df['solution'] != '']
-
-# Drop duplicate rows based on 'observation', 'solution', 'problemcause', and 'problemcode'
-combined_df = combined_df.drop_duplicates(subset=['project', 'database', 'language', 'observation', 'solution', 'problemcause', 'problemcode', 'observationcategory', 'solutioncategory'])
+        combined_df[col] = ""
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-# Rename columns
 column_mapping = {
     "observationcategory": "observation_category",
     "problemcode": "problem_code",
@@ -203,28 +229,168 @@ column_mapping = {
     "mintimeperonepersonsol": "min_time_per_one_person_sol",
     "maxtimeperonepersonsol": "max_time_per_one_person_sol",
     "averagetimesol": "average_time_sol",
+    'frequencysol': 'frequency_sol',
     "failureclass": "failure_class"
 }
 
 # Rename the columns in the combined_df DataFrame
 combined_df.rename(columns=column_mapping, inplace=True)
 
-for column in combined_df.columns:
-    if combined_df[column].dtype == object:
-        combined_df[column] = combined_df[column].fillna('')
-    else:
-        combined_df[column] = combined_df[column].fillna(0)
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+# Add new columns with default empty string values
+new_columns = ['category_id', 'obs_id', 'sol_category_id']
+for col in new_columns:
+    combined_df[col] = ""
+
+# Detect columns with mixed data types and convert them to strings
+mixed_type_columns = [
+    col for col in combined_df.columns if combined_df[col].map(type).nunique() > 1
+]
+for col in mixed_type_columns:
+    combined_df[col] = combined_df[col].astype(str)
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
-# Identify and convert problematic columns to strings
-mixed_type_cols = [col for col in combined_df.columns if combined_df[col].map(type).nunique() > 1]
-for col in mixed_type_cols:
-    combined_df[col] = combined_df[col].astype(str)
+def replace_nan_with_empty_string(df):
+    return df.replace(["NaN", np.nan, pd.NA], "", regex=False)
+
+combined_df = replace_nan_with_empty_string(combined_df)
+
+# -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
+try:
+    # Define project configurations with exact case-sensitive names
+    project_configs = {
+        "LMRC": {
+            "textual_columns": ["problem_cause"],
+            "coded_columns": ["observation_category"]
+        },
+        "222 - EMR": {
+            "textual_columns": ["observation_category"],
+            "coded_columns": []
+        },
+        "NS16": {
+            "textual_columns": [],
+            "coded_columns": []
+        },
+        "Dubai": {
+            "textual_columns": ["observation_category", "problem_cause"],
+            "coded_columns": []
+        },
+        "IND_E_Loco": {
+            "textual_columns": ["problem_cause"],
+            "coded_columns": []
+        },
+        "iTAC-Nantes": {
+            "textual_columns": ["problem_cause"],
+            "coded_columns": []
+        },
+        "Italy": {
+            "textual_columns": ["observation_category"],
+            "coded_columns": []
+        },
+        "KZ4AT": {
+            "textual_columns": [],
+            "coded_columns": ["observation_category"]
+        },
+        "NET2": {
+            "textual_columns": ["observation_category", "problem_cause"],
+            "coded_columns": []
+        },
+        "KZ8A": {
+            "textual_columns": [],
+            "coded_columns": ["problem_cause"]
+        },
+        "Panama": {
+            "textual_columns": [],
+            "coded_columns": []
+        },
+        "REG2N": {
+            "textual_columns": ["observation_category", "problem_cause"],
+            "coded_columns": []
+        },
+        "REM": {
+            "textual_columns": ["observation_category"],
+            "coded_columns": ["problem_cause"]
+        },
+        "U400 - Lyon": {
+            "textual_columns": ["observation_category"],
+            "coded_columns": []
+        },
+        "VLINE RRSMC": {
+            "textual_columns": ["observation_category", "problem_cause"],
+            "coded_columns": []
+        },
+        "TIB": {
+            "textual_columns": ["observation_category"],
+            "coded_columns": []
+        },
+        "Spain": {
+            "textual_columns": ["observation_category"],
+            "coded_columns": []
+        },
+        "Merval": {
+            "textual_columns": ["problem_cause"],
+            "coded_columns": []
+        },
+        "U400": {
+            "textual_columns": ["observation_category"],
+            "coded_columns": []
+        }
+    }
+
+    logger.info(f"Created project configuration mapping for {len(project_configs)} projects")
+
+    # Apply transformations to the actual dataset
+    logger.info("Starting to process the dataset rows")
+    result_frames = []
+
+    # Process each project's data separately
+    for project_name, project_df in combined_df.groupby("project"):
+        if project_name in project_configs:
+            logger.info(f"Processing {len(project_df)} rows for project {project_name}")
+
+            # Get project configuration
+            config = project_configs[project_name]
+
+            # Initialize new columns with empty strings
+            project_df["observation_category_text"] = ""
+            project_df["observation_category_code"] = ""
+            project_df["problem_cause_text"] = ""
+            project_df["problem_cause_code"] = ""
+
+            # Handle `observation_category`
+            if "observation_category" in config["textual_columns"]:
+                project_df["observation_category_text"] = project_df["observation_category"]
+            if "observation_category" in config["coded_columns"]:
+                project_df["observation_category_code"] = project_df["observation_category"]
+
+            # Handle `problem_cause`
+            if "problem_cause" in config["textual_columns"]:
+                project_df["problem_cause_text"] = project_df["problem_cause"]
+            if "problem_cause" in config["coded_columns"]:
+                project_df["problem_cause_code"] = project_df["problem_cause"]
+
+            result_frames.append(project_df)
+        else:
+            logger.warning(f"No configuration found for project {project_name}")
+            project_df["observation_category_text"] = ""
+            project_df["observation_category_code"] = ""
+            project_df["problem_cause_text"] = ""
+            project_df["problem_cause_code"] = ""
+            result_frames.append(project_df)
+
+    # Combine all processed data
+    sts_cmb_final_df = pd.concat(result_frames, ignore_index=True)
+    logger.info(f"Created final DataFrame with {len(sts_cmb_final_df)} rows")
+    logger.info("Data processing pipeline completed successfully")
+
+except Exception as e:
+    logger.error(f"Error in data processing pipeline: {str(e)}", exc_info=True)
+    raise
 
 # -------------------------------------------------------------------------------- NOTEBOOK-CELL: CODE
 # Save the enhanced knowledge base
 logging.info("Saving Processed knowledge base...")
 output_file = 'sts_cmb'
 output_dataset = dataiku.Dataset(output_file)
-output_dataset.write_with_schema(combined_df)
+output_dataset.write_with_schema(sts_cmb_final_df)
 logging.info(f"Processed knowledge base saved to '{output_file}'")
